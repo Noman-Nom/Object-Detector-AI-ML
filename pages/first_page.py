@@ -1,53 +1,73 @@
 import streamlit as st
-from clarifai.client.auth import create_stub
-from clarifai.client.auth.helper import ClarifaiAuthHelper
-from clarifai.client.user import User
+import os
 from clarifai.modules.css import ClarifaiStreamlitCSS
-from google.protobuf import json_format, timestamp_pb2
+from clarifai.client.model import Model
+from io import BytesIO
+import requests
+from PIL import Image, ImageDraw, ImageFont
 
 st.set_page_config(layout="wide")
 ClarifaiStreamlitCSS.insert_default_css(st)
 
-# This must be within the display() function.
-auth = ClarifaiAuthHelper.from_streamlit(st)
-stub = create_stub(auth)
-userDataObject = auth.get_user_app_id_proto()
+st.title("Data Labeling using General Object Detection Model and GPT4 Vision")
 
-st.title("Simple example to list inputs")
+# Usage: new
+def main():
+    IMAGE_URL = st.text_input("Paste an Image URL below to get started!", value="https://s3.amazonaws.com/samples.clarifai.com/black-car.jpg")
 
-with st.form(key="data-inputs"):
-  mtotal = st.number_input(
-      "Select number of inputs to view in a table:", min_value=5, max_value=100)
-  submitted = st.form_submit_button('Submit')
+    # Clarifai Credentials
+    st.subheader('Add your Clarifai PAT.')
+    clarifai_pat = st.text_input('Clarifai PAT:', type='password')
+    
+    if not clarifai_pat:
+        st.warning('Please enter your PAT to continue!', icon='A')
+    else:
+        os.environ['CLARIFAI_PAT'] = clarifai_pat
+        detector_model = Model("https://clarifai.com/clarifai/main/models/objectness-detector")
+        prediction_response = detector_model.predict_by_url(IMAGE_URL, input_type="image")
+        
+        # Since we have one input, one output will exist here
+        regions = prediction_response.outputs[0].data.regions
+        model_url = "https://clarifai.com/openai/chat-completion/models/gpt-4-vision"
+        classes = ['Ferrari 812', 'Volkswagen Beetle', 'BMW M5', 'Honda Civic']
+        threshold = 0.99
+        
+        response = requests.get(IMAGE_URL)
+        img = Image.open(BytesIO(response.content))
+        draw = ImageDraw.Draw(img)
+        
+        for region in regions:
+            # Accessing and rounding the bounding box values
+            top_row = round(region.region_info.bounding_box.top_row, 3)
+            left_col = round(region.region_info.bounding_box.left_col, 3)
+            bottom_row = round(region.region_info.bounding_box.bottom_row, 3)
+            right_col = round(region.region_info.bounding_box.right_col, 3)
+            
+            for concept in region.data.concepts:
+                # Accessing and rounding the concept value
+                prompt = f"Label the Car in the Bounding Box region: ({top_row}, {left_col}, {bottom_row}, {right_col}) with one word {classes}"
+                inference_params = dict(temperature=0.2, max_tokens=100, image_url=IMAGE_URL)
+                
+                # Model Predict
+                model_prediction = Model(model_url).predict_by_bytes(prompt.encode(), input_type="text", inference_params=inference_params)
+                
+                concept_name = model_prediction.outputs[0].data.text.raw
+                value = round(concept.value, 4)
+                
+                if value > threshold:
+                    # Multiply by axis
+                    top_row = top_row * img.height
+                    left_col = left_col * img.width
+                    bottom_row = bottom_row * img.height
+                    right_col = right_col * img.width
 
-if submitted:
-  if mtotal is None or mtotal == 0:
-    st.warning("Number of inputs must be provided.")
-    st.stop()
-  else:
-    st.write("Number of inputs in table will be: {}".format(mtotal))
+                    draw.rectangle([(int(left_col), int(top_row)), (int(right_col), int(bottom_row))], outline=(36, 255, 12), width=2)
 
-  # Stream inputs from the app. list_inputs give list of dictionaries with inputs and its metadata .
-  input_obj = User(user_id=userDataObject.user_id).app(app_id=userDataObject.app_id).inputs()
-  all_inputs = input_obj.list_inputs()
+                    # Display text
+                    font = ImageFont.load_default()
+                    draw.text((int(left_col), int(top_row) + 10), concept_name, font=font, fill=(36, 255, 12))
 
-  #Check for no of inputs in the app and compare it with no of inputs to be displayed.
-  if len(all_inputs) < (mtotal):
-    raise Exception(
-        f"No of inputs is less than {mtotal}. Please add more inputs or reduce the inputs to be displayed !"
-    )
+        st.image(img, caption="Image with Label", channels='BGR', use_column_width=True)
 
-  else:
-    data = []
-    #added "data_url" which gives the url of the input.
-    for inp in range(mtotal):
-      data.append({
-          "id": all_inputs[inp].id,
-          "data_url": all_inputs[inp].data.image.url,
-          "status": all_inputs[inp].status.description,
-          "created_at": timestamp_pb2.Timestamp.ToDatetime(all_inputs[inp].created_at),
-          "modified_at": timestamp_pb2.Timestamp.ToDatetime(all_inputs[inp].modified_at),
-          "metadata": json_format.MessageToDict(all_inputs[inp].data.metadata),
-      })
-
-  st.dataframe(data)
+if __name__ == '__main__':
+    main()
